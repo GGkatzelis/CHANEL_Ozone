@@ -2,7 +2,7 @@ import io
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -81,6 +81,7 @@ CSV_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_AMSandTracegas
 EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OZONE_COLUMN = "O3_TwoBTech_1014"
 ENDTIME_COLUMN = "Endtime_UTC"
+REACTIONTIME_COLUMN = "reactiontime_UTC"
 
 
 def find_datetime_column(columns):
@@ -163,10 +164,21 @@ def load_excel_dataset(path):
         raise ValueError("Excel file missing required 'Date' column")
     if ENDTIME_COLUMN not in df.columns:
         raise ValueError(f"Excel file missing required '{ENDTIME_COLUMN}' column")
+    if REACTIONTIME_COLUMN not in df.columns:
+        raise ValueError(f"Excel file missing required '{REACTIONTIME_COLUMN}' column")
 
     df["__date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
     df[ENDTIME_COLUMN] = pd.to_datetime(df[ENDTIME_COLUMN], errors="coerce")
-    df = df[["__date", ENDTIME_COLUMN]].dropna(subset=["__date"])
+    df[REACTIONTIME_COLUMN] = pd.to_datetime(df[REACTIONTIME_COLUMN], errors="coerce")
+
+    injection_columns = [c for c in df.columns if c.lower().endswith("_injectiontime")]
+    if not injection_columns:
+        raise ValueError("Excel file has no columns ending with '_injectiontime'")
+
+    for col in injection_columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    df = df[["__date", ENDTIME_COLUMN, REACTIONTIME_COLUMN] + injection_columns].dropna(subset=["__date"])
 
     return df
 
@@ -242,30 +254,38 @@ def create_tab1(frame):
 
         selected_date = datetime.fromisoformat(selected).date()
         excel_day = df_excel[df_excel["__date"] == selected_date]
-        # collect peak points to highlight
-        peak_times = []
-        peak_vals = []
         if not excel_day.empty:
             first_label = True
+            injection_cols = [c for c in excel_day.columns if c.lower().endswith("_injectiontime")]
             for endtime in excel_day[ENDTIME_COLUMN].dropna().unique():
-                # draw vertical line for Endtime
                 ax.axvline(endtime, color="#ff7f0e", linestyle="--", linewidth=2,
                            label="Endtime_UTC" if first_label else None)
                 first_label = False
 
-                # find highest ozone datapoint strictly before this endtime
                 before = day_df[day_df["__timestamp"] < endtime].copy()
                 before = before.dropna(subset=["ozone"])
                 if not before.empty:
-                    # find index of maximum ozone
                     idxmax = before["ozone"].idxmax()
                     peak_row = before.loc[idxmax]
-                    peak_times.append(peak_row["__timestamp"])
-                    peak_vals.append(peak_row["ozone"])
+                    ax.scatter([peak_row["__timestamp"]], [peak_row["ozone"]], color="red", s=60, zorder=5,
+                               label="Peak before Endtime" if first_label else None)
+                    first_label = False
 
-        # plot peaks as red markers
-        if peak_times:
-            ax.scatter(peak_times, peak_vals, color="red", s=60, zorder=5, label="Peak before Endtime")
+            injection_times = []
+            for _, row in excel_day.iterrows():
+                for col in injection_cols:
+                    if pd.notna(row[col]):
+                        injection_times.append(row[col])
+            if injection_times:
+                earliest_injection = min(injection_times) - timedelta(hours=2)
+                ax.axvline(earliest_injection, color="gray", linestyle="--", linewidth=2,
+                           label="earliest injection time_UTC")
+
+            roof_open_labeled = False
+            for reaction_time in excel_day[REACTIONTIME_COLUMN].dropna().unique():
+                ax.axvline(reaction_time, color="green", linestyle="--", linewidth=2,
+                           label="roof open" if not roof_open_labeled else None)
+                roof_open_labeled = True
 
         ax.set_title(f"Ozone time series for {selected}")
         ax.set_xlabel("Time")
