@@ -1,3 +1,4 @@
+import io
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -7,8 +8,79 @@ import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    CF_DIB = 8
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+    GHND = GMEM_MOVEABLE | GMEM_ZEROINIT
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    # declare argument and result types for the Win32 API calls we use
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalFree.argtypes = (wintypes.HGLOBAL,)
+
+    user32.OpenClipboard.argtypes = (wintypes.HWND,)
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.restype = wintypes.BOOL
+
+    def _copy_image_to_clipboard(image):
+        output = io.BytesIO()
+        image.convert("RGB").save(output, format="BMP")
+        data = output.getvalue()[14:]
+        output.close()
+
+        size = len(data)
+        hglob = kernel32.GlobalAlloc(GHND, size)
+        if not hglob:
+            raise RuntimeError("GlobalAlloc failed")
+
+        ptr = kernel32.GlobalLock(hglob)
+        if not ptr:
+            kernel32.GlobalFree(hglob)
+            raise RuntimeError("GlobalLock failed")
+
+        # copy data into the global memory block
+        ctypes.memmove(ctypes.c_void_p(ptr), data, size)
+        kernel32.GlobalUnlock(hglob)
+
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(hglob)
+            raise RuntimeError("OpenClipboard failed")
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(CF_DIB, hglob):
+                raise RuntimeError("SetClipboardData failed")
+            # ownership of hglob transferred to the clipboard on success
+            hglob = None
+        finally:
+            user32.CloseClipboard()
+            if hglob:
+                kernel32.GlobalFree(hglob)
+else:
+    def _copy_image_to_clipboard(image):
+        raise RuntimeError("Clipboard image copy is only supported on Windows")
+
 CSV_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_AMSandTracegas_forTS.csv"
+EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OZONE_COLUMN = "O3_TwoBTech_1014"
+ENDTIME_COLUMN = "Endtime_UTC"
 
 
 def find_datetime_column(columns):
@@ -79,6 +151,26 @@ def load_dataset(path):
     return df
 
 
+def load_excel_dataset(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    df = pd.read_excel(path)
+    if df.empty:
+        raise ValueError("Excel file is empty")
+
+    if "Date" not in df.columns:
+        raise ValueError("Excel file missing required 'Date' column")
+    if ENDTIME_COLUMN not in df.columns:
+        raise ValueError(f"Excel file missing required '{ENDTIME_COLUMN}' column")
+
+    df["__date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df[ENDTIME_COLUMN] = pd.to_datetime(df[ENDTIME_COLUMN], errors="coerce")
+    df = df[["__date", ENDTIME_COLUMN]].dropna(subset=["__date"])
+
+    return df
+
+
 def get_available_dates(df):
     df = df.copy()
     df["__day"] = df["__timestamp"].dt.date
@@ -106,6 +198,9 @@ def create_tab1(frame):
     refresh_button = ttk.Button(control_frame, text="Plot day")
     refresh_button.grid(row=0, column=2, padx=(10, 0), sticky="w")
 
+    clipboard_button = ttk.Button(control_frame, text="Copy figure to clipboard")
+    clipboard_button.grid(row=0, column=3, padx=(10, 0), sticky="w")
+
     message_label = ttk.Label(frame, text="", foreground="red")
     message_label.pack(anchor="w", padx=10)
 
@@ -121,6 +216,7 @@ def create_tab1(frame):
 
     try:
         df = load_dataset(CSV_PATH)
+        df_excel = load_excel_dataset(EXCEL_PATH)
         dates = get_available_dates(df)
         if not dates:
             raise ValueError("No valid data rows found after parsing timestamps")
@@ -142,15 +238,72 @@ def create_tab1(frame):
             return
 
         ax.clear()
-        ax.plot(day_df["__timestamp"], day_df["ozone"], marker="o", linestyle="-", color="#1f77b4")
+        ax.plot(day_df["__timestamp"], day_df["ozone"], marker="o", linestyle="-", color="#1f77b4", label="Ozone")
+
+        selected_date = datetime.fromisoformat(selected).date()
+        excel_day = df_excel[df_excel["__date"] == selected_date]
+        # collect peak points to highlight
+        peak_times = []
+        peak_vals = []
+        if not excel_day.empty:
+            first_label = True
+            for endtime in excel_day[ENDTIME_COLUMN].dropna().unique():
+                # draw vertical line for Endtime
+                ax.axvline(endtime, color="#ff7f0e", linestyle="--", linewidth=2,
+                           label="Endtime_UTC" if first_label else None)
+                first_label = False
+
+                # find highest ozone datapoint strictly before this endtime
+                before = day_df[day_df["__timestamp"] < endtime].copy()
+                before = before.dropna(subset=["ozone"])
+                if not before.empty:
+                    # find index of maximum ozone
+                    idxmax = before["ozone"].idxmax()
+                    peak_row = before.loc[idxmax]
+                    peak_times.append(peak_row["__timestamp"])
+                    peak_vals.append(peak_row["ozone"])
+
+        # plot peaks as red markers
+        if peak_times:
+            ax.scatter(peak_times, peak_vals, color="red", s=60, zorder=5, label="Peak before Endtime")
+
         ax.set_title(f"Ozone time series for {selected}")
         ax.set_xlabel("Time")
         ax.set_ylabel("Ozone")
         ax.grid(True, linestyle="--", alpha=0.4)
+        if not excel_day.empty:
+            ax.legend()
         fig.autofmt_xdate(rotation=25)
         canvas.draw()
 
+    def copy_figure_to_clipboard():
+        if Image is None:
+            messagebox.showerror(
+                "Missing dependency",
+                "Pillow is required to copy figures to the clipboard. Install it with: pip install pillow",
+            )
+            return
+
+        if os.name != "nt":
+            messagebox.showerror(
+                "Unsupported platform",
+                "Clipboard image copy is supported only on Windows.",
+            )
+            return
+
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png")
+        buffer.seek(0)
+        image = Image.open(buffer)
+
+        try:
+            _copy_image_to_clipboard(image)
+            messagebox.showinfo("Copied", "Figure image copied to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("Clipboard error", str(exc))
+
     refresh_button.config(command=draw_plot)
+    clipboard_button.config(command=copy_figure_to_clipboard)
     draw_plot()
 
 
