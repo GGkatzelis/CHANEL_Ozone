@@ -80,6 +80,12 @@ else:
 CSV_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_AMSandTracegas_forTS.csv"
 EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OH_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\OHreactivity.csv"
+TVOC_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_kOH.csv"
+TARGET_DATES = [
+    "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
+    "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
+    "2024-07-29", "2024-07-30",
+]
 OZONE_COLUMN = "O3_TwoBTech_1014"
 NOX_COLUMN = "NOx_CLD_TR43"
 ENDTIME_COLUMN = "Endtime_UTC"
@@ -275,6 +281,103 @@ def compute_tab2_data(df, df_excel, df_oh):
     return pd.DataFrame(rows)
 
 
+def load_tvoc_dataset(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"TVOC file not found: {path}")
+
+    df = pd.read_csv(path, low_memory=False)
+    if df.empty:
+        raise ValueError("TVOC file is empty")
+    if "time" not in df.columns or "kOH" not in df.columns:
+        raise ValueError("TVOC file must contain 'time' and 'kOH' columns")
+
+    df["__timestamp"] = pd.to_datetime(df["time"], errors="coerce")
+    if df["__timestamp"].isna().all():
+        raise ValueError("Could not parse any timestamps from the TVOC file")
+
+    df["kOH"] = pd.to_numeric(df["kOH"], errors="coerce")
+    return df.dropna(subset=["__timestamp"]).sort_values("__timestamp").reset_index(drop=True)
+
+
+def compute_tab2_10min_data(df, df_excel, tvoc_df):
+    rows = []
+
+    for date_string in TARGET_DATES:
+        date_obj = datetime.fromisoformat(date_string).date()
+        day_df = df[df["__timestamp"].dt.date == date_obj].copy()
+        if day_df.empty:
+            continue
+
+        excel_day = df_excel[df_excel["__date"] == date_obj]
+        if excel_day.empty:
+            continue
+
+        roof_open_times = excel_day[REACTIONTIME_COLUMN].dropna().unique()
+        if len(roof_open_times) == 0:
+            continue
+
+        roof_open = min(roof_open_times)
+        background_start = roof_open - timedelta(hours=1)
+        background_period = day_df[(day_df["__timestamp"] >= background_start) & (day_df["__timestamp"] <= roof_open)]
+        if background_period.empty:
+            continue
+        background_ozone = background_period["ozone"].mean()
+
+        peak_rows = []
+        for endtime in excel_day[ENDTIME_COLUMN].dropna().unique():
+            before_end = day_df[day_df["__timestamp"] < endtime].dropna(subset=["ozone"])
+            if not before_end.empty:
+                idxmax = before_end["ozone"].idxmax()
+                peak_rows.append(before_end.loc[idxmax])
+        if not peak_rows:
+            continue
+        peak_row = max(peak_rows, key=lambda r: r["ozone"])
+        peak_time = peak_row["__timestamp"]
+        if peak_time <= roof_open:
+            continue
+
+        if "nox" not in day_df.columns:
+            continue
+
+        resampled = (
+            day_df.set_index("__timestamp")[['ozone', 'nox']]
+            .resample('10min')
+            .mean()
+            .dropna(how='all')
+        )
+        resampled = resampled[(resampled.index > roof_open) & (resampled.index <= peak_time)]
+        if resampled.empty:
+            continue
+
+        tvoc_series = tvoc_df.set_index("__timestamp")[["kOH"]]
+        merged = pd.merge_asof(
+            resampled.reset_index().sort_values("__timestamp"),
+            tvoc_series.reset_index().sort_values("__timestamp"),
+            on="__timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta("10min"),
+        )
+
+        for _, row in merged.iterrows():
+            if pd.isna(row["kOH"]) or pd.isna(row["ozone"]) or pd.isna(row["nox"]):
+                continue
+
+            elapsed_hr = (row["__timestamp"] - roof_open).total_seconds() / 3600.0
+            if elapsed_hr <= 0:
+                continue
+
+            opr_ppbv_h = (row["ozone"] - background_ozone) / elapsed_hr
+            rows.append({
+                "date": date_obj,
+                "timestamp": row["__timestamp"],
+                "opr_ppbv_h": opr_ppbv_h,
+                "tvoc_s1": row["kOH"],
+                "nox": row["nox"],
+            })
+
+    return pd.DataFrame(rows)
+
+
 def get_available_dates(df):
     if df is None or df.empty:
         return []
@@ -434,7 +537,7 @@ def build_gui():
     create_tab1(tab1)
 
     tab2 = ttk.Frame(notebook)
-    notebook.add(tab2, text="OPR figures")
+    notebook.add(tab2, text="Tab 2: OPR Figures")
     create_tab2(tab2)
 
     tab3 = ttk.Frame(notebook)
@@ -448,44 +551,112 @@ def create_tab2(frame):
     file_label = ttk.Label(frame, text=f"OH reactivity file: {OH_PATH}")
     file_label.pack(anchor="w", padx=10, pady=(10, 0))
 
+    file_label2 = ttk.Label(frame, text=f"TVOC file: {TVOC_PATH}")
+    file_label2.pack(anchor="w", padx=10, pady=(0, 10))
+
+    control_frame = ttk.Frame(frame)
+    control_frame.pack(fill="x", padx=10, pady=10)
+
+    ttk.Label(control_frame, text="Select figure:").grid(row=0, column=0, sticky="w")
+    figure_var = tk.StringVar()
+    figure_combo = ttk.Combobox(
+        control_frame,
+        textvariable=figure_var,
+        state="readonly",
+        values=[
+            "Ozone enhancement for each experiment",
+            "OPR vs. TVOC",
+        ],
+        width=30,
+    )
+    figure_combo.grid(row=0, column=1, padx=(8, 0), sticky="w")
+    figure_combo.current(0)
+
+    message_label = ttk.Label(frame, text="", foreground="red")
+    message_label.pack(anchor="w", padx=10)
+
     fig = Figure(figsize=(8, 4), dpi=100)
     ax = fig.add_subplot(111)
-    ax.set_title("OPR figure: Ozone enhancement vs kOH_LP_sync_avg")
-    ax.set_xlabel("kOH_LP_sync_avg (s-1)")
-    ax.set_ylabel("Ozone enhancement (ppb)")
-    fig.tight_layout()
-
     canvas = FigureCanvasTkAgg(fig, master=frame)
-    canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+    canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    current_cbar = None
 
     try:
         df = load_dataset(CSV_PATH)
         df_excel = load_excel_dataset(EXCEL_PATH)
         df_oh = load_oh_reactivity(OH_PATH)
+        tvoc_df = load_tvoc_dataset(TVOC_PATH)
         tab2_data = compute_tab2_data(df, df_excel, df_oh)
-        if tab2_data.empty:
-            raise ValueError("No valid Tab 2 data could be computed for the selected dates")
+        tab2_10min_data = compute_tab2_10min_data(df, df_excel, tvoc_df)
     except Exception as exc:
-        ttk.Label(frame, text=str(exc), foreground="red").pack(padx=10, pady=10)
+        message_label.config(text=str(exc))
         return
 
-    scatter = ax.scatter(
-        tab2_data["kOH_LP_sync_avg"],
-        tab2_data["ozone_increase"],
-        c=tab2_data["nox_avg"],
-        cmap="viridis",
-        s=120,
-        edgecolor="black",
-        linewidth=0.5,
-    )
-    for _, row in tab2_data.iterrows():
-        ax.annotate(row["date"].isoformat(), (row["kOH_LP_sync_avg"], row["ozone_increase"]),
-                    textcoords="offset points", xytext=(5, 5), ha="left", fontsize=8)
+    def draw_tab2():
+        nonlocal current_cbar, ax
+        fig.clear()
+        ax = fig.add_subplot(111)
+        current_cbar = None
 
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("NOx avg (ppb)")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    canvas.draw()
+        selected = figure_var.get().strip()
+
+        if "Ozone enhancement" in selected:
+            if tab2_data.empty:
+                message_label.config(text="No valid experiment-level data available.")
+                canvas.draw()
+                return
+            message_label.config(text="")
+            ax.set_title("Ozone enhancement for each experiment")
+            ax.set_xlabel("Injected TVOC (s-1)")
+            ax.set_ylabel("Ozone enhancement (ppb)")
+            scatter = ax.scatter(
+                tab2_data["kOH_LP_sync_avg"],
+                tab2_data["ozone_increase"],
+                c=tab2_data["nox_avg"],
+                cmap="viridis",
+                s=120,
+                edgecolor="black",
+                linewidth=0.5,
+            )
+            for _, row in tab2_data.iterrows():
+                ax.annotate(
+                    row["date"].isoformat(),
+                    (row["kOH_LP_sync_avg"], row["ozone_increase"]),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    ha="left",
+                    fontsize=8,
+                )
+            current_cbar = fig.colorbar(scatter, ax=ax)
+            current_cbar.set_label("NOx avg (ppb)")
+
+        elif "OPR" in selected:
+            if tab2_10min_data.empty:
+                message_label.config(text="No valid 10-minute OPR data available.")
+                canvas.draw()
+                return
+            message_label.config(text="")
+            ax.set_title("OPR vs. TVOC")
+            ax.set_xlabel("TVOC (s-1)")
+            ax.set_ylabel("OPR (ppbv/h)")
+            scatter = ax.scatter(
+                tab2_10min_data["tvoc_s1"],
+                tab2_10min_data["opr_ppbv_h"],
+                c=tab2_10min_data["nox"],
+                cmap="viridis",
+                s=40,
+                edgecolor="black",
+                linewidth=0.2,
+            )
+            current_cbar = fig.colorbar(scatter, ax=ax)
+            current_cbar.set_label("NOx (ppb)")
+
+        ax.grid(True, linestyle="--", alpha=0.4)
+        fig.tight_layout()
+        canvas.draw()
+
+    figure_var.trace_add('write', lambda *args: draw_tab2())
+    draw_tab2()
 
 
 if __name__ == "__main__":
