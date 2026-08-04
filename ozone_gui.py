@@ -572,6 +572,7 @@ def create_tab2(frame):
             "Ozone enhancement for each experiment",
             "OPR for each experiment",
             "OPR vs. TVOC",
+            "NOx vs. TVOC",
         ],
         width=30,
     )
@@ -691,6 +692,45 @@ def create_tab2(frame):
             )
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label("NOx (ppb)")
+
+        elif "NOx vs. TVOC" in selected:
+            if tab2_10min_data.empty:
+                message_label.config(text="No valid 10-minute OPR data available.")
+                canvas.draw()
+                return
+            message_label.config(text="")
+            ax.set_title("NOx vs. TVOC")
+            ax.set_xlabel("TVOC (s-1)")
+            ax.set_ylabel("NOx (ppb)")
+            scatter = ax.scatter(
+                tab2_10min_data["tvoc_s1"],
+                tab2_10min_data["nox"],
+                c=tab2_10min_data["opr_ppbv_h"],
+                cmap="YlOrRd",
+                s=40,
+                edgecolor="black",
+                linewidth=0.2,
+            )
+            current_cbar = fig.colorbar(scatter, ax=ax)
+            current_cbar.set_label("OPR (ppbv/h)")
+
+            x_min = 0
+            x_max = 100
+            y_min = 0
+            y_max = 8
+            for ratio, label in [(0.05, "1:20"), (0.1, "1:10"), (0.2, "1:5"), (1.0, "1:1")]:
+                y_vals = [ratio * x for x in [x_min, x_max]]
+                ax.plot([x_min, x_max], y_vals, linestyle="--", color="gray", linewidth=1.0, alpha=0.7)
+                x_label = min(x_max * 0.85, y_max / ratio * 0.85)
+                y_label = ratio * x_label
+                if y_label > y_max * 0.95:
+                    y_label = y_max * 0.95
+                ax.text(x_label, y_label, label, fontsize=8, color="gray", ha="left", va="bottom")
+
+            ax.set_xscale("linear")
+            ax.set_yscale("linear")
+            ax.set_xlim(0, 100)
+            ax.set_ylim(0, 8)
 
         ax.grid(True, linestyle="--", alpha=0.4)
         fig.tight_layout()
