@@ -254,6 +254,10 @@ def compute_tab2_data(df, df_excel, df_oh):
         peak_ozone = peak_row["ozone"]
         peak_time = peak_row["__timestamp"]
         ozone_increase = peak_ozone - background_ozone
+        elapsed_hr = (peak_time - roof_open).total_seconds() / 3600.0
+        if elapsed_hr <= 0:
+            continue
+        experiment_opr = ozone_increase / elapsed_hr
 
         nox_avg = None
         if "nox" in day_df.columns:
@@ -276,6 +280,7 @@ def compute_tab2_data(df, df_excel, df_oh):
             "ozone_increase": ozone_increase,
             "kOH_LP_sync_avg": koh,
             "nox_avg": nox_avg,
+            "experiment_opr": experiment_opr,
         })
 
     return pd.DataFrame(rows)
@@ -565,6 +570,7 @@ def create_tab2(frame):
         state="readonly",
         values=[
             "Ozone enhancement for each experiment",
+            "OPR for each experiment",
             "OPR vs. TVOC",
         ],
         width=30,
@@ -574,6 +580,11 @@ def create_tab2(frame):
 
     message_label = ttk.Label(frame, text="", foreground="red")
     message_label.pack(anchor="w", padx=10)
+
+    button_frame = ttk.Frame(frame)
+    button_frame.pack(fill="x", padx=10, pady=(0, 8))
+    clipboard_button = ttk.Button(button_frame, text="Copy figure to clipboard")
+    clipboard_button.pack(anchor="w")
 
     fig = Figure(figsize=(8, 4), dpi=100)
     ax = fig.add_subplot(111)
@@ -613,7 +624,7 @@ def create_tab2(frame):
                 tab2_data["kOH_LP_sync_avg"],
                 tab2_data["ozone_increase"],
                 c=tab2_data["nox_avg"],
-                cmap="viridis",
+                cmap="YlOrRd",
                 s=120,
                 edgecolor="black",
                 linewidth=0.5,
@@ -630,7 +641,37 @@ def create_tab2(frame):
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label("NOx avg (ppb)")
 
-        elif "OPR" in selected:
+        elif "OPR for each experiment" in selected:
+            if tab2_data.empty:
+                message_label.config(text="No valid experiment-level OPR data available.")
+                canvas.draw()
+                return
+            message_label.config(text="")
+            ax.set_title("OPR for each experiment")
+            ax.set_xlabel("Injected TVOC (s-1)")
+            ax.set_ylabel("Experiment OPR (ppbv/h)")
+            scatter = ax.scatter(
+                tab2_data["kOH_LP_sync_avg"],
+                tab2_data["experiment_opr"],
+                c=tab2_data["nox_avg"],
+                cmap="YlOrRd",
+                s=120,
+                edgecolor="black",
+                linewidth=0.5,
+            )
+            for _, row in tab2_data.iterrows():
+                ax.annotate(
+                    row["date"].isoformat(),
+                    (row["kOH_LP_sync_avg"], row["experiment_opr"]),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    ha="left",
+                    fontsize=8,
+                )
+            current_cbar = fig.colorbar(scatter, ax=ax)
+            current_cbar.set_label("NOx avg (ppb)")
+
+        elif "OPR vs. TVOC" in selected:
             if tab2_10min_data.empty:
                 message_label.config(text="No valid 10-minute OPR data available.")
                 canvas.draw()
@@ -643,7 +684,7 @@ def create_tab2(frame):
                 tab2_10min_data["tvoc_s1"],
                 tab2_10min_data["opr_ppbv_h"],
                 c=tab2_10min_data["nox"],
-                cmap="viridis",
+                cmap="YlOrRd",
                 s=40,
                 edgecolor="black",
                 linewidth=0.2,
@@ -655,6 +696,33 @@ def create_tab2(frame):
         fig.tight_layout()
         canvas.draw()
 
+    def copy_figure_to_clipboard():
+        if Image is None:
+            messagebox.showerror(
+                "Missing dependency",
+                "Pillow is required to copy figures to the clipboard. Install it with: pip install pillow",
+            )
+            return
+
+        if os.name != "nt":
+            messagebox.showerror(
+                "Unsupported platform",
+                "Clipboard image copy is supported only on Windows.",
+            )
+            return
+
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png")
+        buffer.seek(0)
+        image = Image.open(buffer)
+
+        try:
+            _copy_image_to_clipboard(image)
+            messagebox.showinfo("Copied", "Figure image copied to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("Clipboard error", str(exc))
+
+    clipboard_button.config(command=copy_figure_to_clipboard)
     figure_var.trace_add('write', lambda *args: draw_tab2())
     draw_tab2()
 
