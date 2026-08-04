@@ -79,7 +79,9 @@ else:
 
 CSV_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_AMSandTracegas_forTS.csv"
 EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
+OH_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\OHreactivity.csv"
 OZONE_COLUMN = "O3_TwoBTech_1014"
+NOX_COLUMN = "NOx_CLD_TR43"
 ENDTIME_COLUMN = "Endtime_UTC"
 REACTIONTIME_COLUMN = "reactiontime_UTC"
 
@@ -144,8 +146,15 @@ def load_dataset(path):
     if ozone_col is None:
         raise ValueError(f"Could not find ozone column '{OZONE_COLUMN}' in the CSV")
 
-    df = df[["__timestamp", ozone_col]].copy()
-    df = df.rename(columns={ozone_col: "ozone"})
+    columns = ["__timestamp", ozone_col]
+    if NOX_COLUMN in df.columns:
+        columns.append(NOX_COLUMN)
+
+    df = df[columns].copy()
+    df = df.rename(columns={ozone_col: "ozone", NOX_COLUMN: "nox"})
+    if "nox" in df.columns:
+        df["nox"] = pd.to_numeric(df["nox"], errors="coerce")
+
     df = df.sort_values("__timestamp").reset_index(drop=True)
     df = df.dropna(subset=["__timestamp"])
 
@@ -183,20 +192,105 @@ def load_excel_dataset(path):
     return df
 
 
+def load_oh_reactivity(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"OH reactivity file not found: {path}")
+
+    df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError("OH reactivity file is empty")
+    if "Date" not in df.columns or "kOH_LP_sync_avg" not in df.columns:
+        raise ValueError("OH reactivity file must contain 'Date' and 'kOH_LP_sync_avg' columns")
+
+    df["__date"] = pd.to_datetime(df["Date"].astype(str).str.replace("_", "-"), format="%Y-%m-%d", errors="coerce").dt.date
+    df = df[["__date", "kOH_LP_sync_avg"]].dropna(subset=["__date"])
+    return df.set_index("__date")
+
+
+def compute_tab2_data(df, df_excel, df_oh):
+    target_dates = [
+        "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
+        "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
+        "2024-07-29", "2024-07-30",
+    ]
+
+    rows = []
+    for date_string in target_dates:
+        date_obj = datetime.fromisoformat(date_string).date()
+        day_df = df[df["__timestamp"].dt.date == date_obj]
+        if day_df.empty:
+            continue
+
+        excel_day = df_excel[df_excel["__date"] == date_obj]
+        if excel_day.empty:
+            continue
+
+        roof_open_times = excel_day[REACTIONTIME_COLUMN].dropna().unique()
+        if len(roof_open_times) == 0:
+            continue
+
+        roof_open = min(roof_open_times)
+        background_start = roof_open - timedelta(hours=1)
+        background_period = day_df[(day_df["__timestamp"] >= background_start) & (day_df["__timestamp"] <= roof_open)]
+        if background_period.empty:
+            continue
+        background_ozone = background_period["ozone"].mean()
+
+        peak_rows = []
+        for endtime in excel_day[ENDTIME_COLUMN].dropna().unique():
+            before_end = day_df[day_df["__timestamp"] < endtime].dropna(subset=["ozone"])
+            if not before_end.empty:
+                idxmax = before_end["ozone"].idxmax()
+                peak_rows.append(before_end.loc[idxmax])
+        if not peak_rows:
+            continue
+        peak_row = max(peak_rows, key=lambda r: r["ozone"])
+        peak_ozone = peak_row["ozone"]
+        peak_time = peak_row["__timestamp"]
+        ozone_increase = peak_ozone - background_ozone
+
+        nox_avg = None
+        if "nox" in day_df.columns:
+            nox_period = day_df[(day_df["__timestamp"] >= roof_open) & (day_df["__timestamp"] <= peak_time)]
+            if not nox_period.empty:
+                nox_avg = nox_period["nox"].mean()
+        if pd.isna(nox_avg):
+            continue
+
+        if date_obj not in df_oh.index:
+            continue
+        koh = df_oh.loc[date_obj, "kOH_LP_sync_avg"]
+        if pd.isna(koh):
+            continue
+
+        rows.append({
+            "date": date_obj,
+            "background_ozone": background_ozone,
+            "peak_ozone": peak_ozone,
+            "ozone_increase": ozone_increase,
+            "kOH_LP_sync_avg": koh,
+            "nox_avg": nox_avg,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def get_available_dates(df):
-    df = df.copy()
-    df["__day"] = df["__timestamp"].dt.date
-    dates = sorted(df["__day"].unique())
-    return [d.isoformat() for d in dates]
+    if df is None or df.empty:
+        return []
+    dates = df["__timestamp"].dt.date.dropna().unique()
+    return [d.isoformat() for d in sorted(dates)]
 
 
-def filter_day(df, day_iso):
-    day = datetime.fromisoformat(day_iso).date()
-    return df[df["__timestamp"].dt.date == day].copy()
+def filter_day(df, selected_date):
+    if not selected_date:
+        return df.iloc[0:0]
+    date_obj = datetime.fromisoformat(selected_date).date()
+    return df[df["__timestamp"].dt.date == date_obj]
 
 
 def create_tab1(frame):
-    file_label = ttk.Label(frame, text=f"CSV file: {CSV_PATH}")
+    file_label = ttk.Label(frame, text=f"Ozone CSV file: {CSV_PATH}")
     file_label.pack(anchor="w", padx=10, pady=(10, 0))
 
     control_frame = ttk.Frame(frame)
@@ -340,14 +434,58 @@ def build_gui():
     create_tab1(tab1)
 
     tab2 = ttk.Frame(notebook)
-    notebook.add(tab2, text="Tab 2")
-    ttk.Label(tab2, text="Future tab content goes here.").pack(padx=16, pady=16)
+    notebook.add(tab2, text="OPR figures")
+    create_tab2(tab2)
 
     tab3 = ttk.Frame(notebook)
     notebook.add(tab3, text="Tab 3")
     ttk.Label(tab3, text="Future tab content goes here.").pack(padx=16, pady=16)
 
     root.mainloop()
+
+
+def create_tab2(frame):
+    file_label = ttk.Label(frame, text=f"OH reactivity file: {OH_PATH}")
+    file_label.pack(anchor="w", padx=10, pady=(10, 0))
+
+    fig = Figure(figsize=(8, 4), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.set_title("OPR figure: Ozone enhancement vs kOH_LP_sync_avg")
+    ax.set_xlabel("kOH_LP_sync_avg (s-1)")
+    ax.set_ylabel("Ozone enhancement (ppb)")
+    fig.tight_layout()
+
+    canvas = FigureCanvasTkAgg(fig, master=frame)
+    canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+    try:
+        df = load_dataset(CSV_PATH)
+        df_excel = load_excel_dataset(EXCEL_PATH)
+        df_oh = load_oh_reactivity(OH_PATH)
+        tab2_data = compute_tab2_data(df, df_excel, df_oh)
+        if tab2_data.empty:
+            raise ValueError("No valid Tab 2 data could be computed for the selected dates")
+    except Exception as exc:
+        ttk.Label(frame, text=str(exc), foreground="red").pack(padx=10, pady=10)
+        return
+
+    scatter = ax.scatter(
+        tab2_data["kOH_LP_sync_avg"],
+        tab2_data["ozone_increase"],
+        c=tab2_data["nox_avg"],
+        cmap="viridis",
+        s=120,
+        edgecolor="black",
+        linewidth=0.5,
+    )
+    for _, row in tab2_data.iterrows():
+        ax.annotate(row["date"].isoformat(), (row["kOH_LP_sync_avg"], row["ozone_increase"]),
+                    textcoords="offset points", xytext=(5, 5), ha="left", fontsize=8)
+
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("NOx avg (ppb)")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    canvas.draw()
 
 
 if __name__ == "__main__":
