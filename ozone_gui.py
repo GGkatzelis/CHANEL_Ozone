@@ -88,6 +88,15 @@ TARGET_DATES = [
 ]
 OZONE_COLUMN = "O3_TwoBTech_1014"
 NOX_COLUMN = "NOx_CLD_TR43"
+NO_COLUMN = "NO_CLD_TR43"
+NO2_COLUMN = "NO2_CLD_TR43"
+# CSV column -> short name used throughout the app, plotted on the secondary axis in tab 1
+NITROGEN_COLUMNS = {NOX_COLUMN: "nox", NO_COLUMN: "no", NO2_COLUMN: "no2"}
+NITROGEN_STYLES = [
+    ("nox", "NOx", "#9467bd"),
+    ("no", "NO", "#8c564b"),
+    ("no2", "NO2", "#e377c2"),
+]
 ENDTIME_COLUMN = "Endtime_UTC"
 REACTIONTIME_COLUMN = "reactiontime_UTC"
 
@@ -137,29 +146,30 @@ def load_dataset(path):
     else:
         timestamp_series = df[dt_col].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
-    df["__timestamp"] = pd.to_datetime(timestamp_series, errors="coerce")
-    if df["__timestamp"].isna().all():
-        df["__timestamp"] = pd.to_datetime(
+    timestamps = pd.to_datetime(timestamp_series, errors="coerce")
+    if timestamps.isna().all():
+        timestamps = pd.to_datetime(
             timestamp_series,
             format="%m/%d/%Y %I:%M:%S %p",
             errors="coerce",
         )
 
-    if df["__timestamp"].isna().all():
+    if timestamps.isna().all():
         raise ValueError("Could not parse any timestamps from the CSV")
 
     ozone_col = OZONE_COLUMN if OZONE_COLUMN in df.columns else find_ozone_column(df.columns)
     if ozone_col is None:
         raise ValueError(f"Could not find ozone column '{OZONE_COLUMN}' in the CSV")
 
-    columns = ["__timestamp", ozone_col]
-    if NOX_COLUMN in df.columns:
-        columns.append(NOX_COLUMN)
+    columns = [ozone_col]
+    present_nitrogen = [c for c in NITROGEN_COLUMNS if c in df.columns]
+    columns.extend(present_nitrogen)
 
     df = df[columns].copy()
-    df = df.rename(columns={ozone_col: "ozone", NOX_COLUMN: "nox"})
-    if "nox" in df.columns:
-        df["nox"] = pd.to_numeric(df["nox"], errors="coerce")
+    df.insert(0, "__timestamp", timestamps)
+    df = df.rename(columns={ozone_col: "ozone", **NITROGEN_COLUMNS})
+    for name in (NITROGEN_COLUMNS[c] for c in present_nitrogen):
+        df[name] = pd.to_numeric(df[name], errors="coerce")
 
     df = df.sort_values("__timestamp").reset_index(drop=True)
     df = df.dropna(subset=["__timestamp"])
@@ -420,9 +430,12 @@ def create_tab1(frame):
 
     fig = Figure(figsize=(8, 4), dpi=100)
     ax = fig.add_subplot(111)
-    ax.set_title("Ozone time series")
+    # nitrogen species are an order of magnitude smaller than ozone, so give them their own axis
+    ax_n = ax.twinx()
+    ax.set_title("Ozone and NOx time series")
     ax.set_xlabel("Time")
     ax.set_ylabel("Ozone")
+    ax_n.set_ylabel("NO / NO2 / NOx")
     fig.tight_layout()
 
     canvas = FigureCanvasTkAgg(fig, master=frame)
@@ -452,17 +465,29 @@ def create_tab1(frame):
             return
 
         ax.clear()
+        ax_n.clear()
+        # clear() restores the twin's background patch, which would hide the ozone line beneath it,
+        # and resets its y-label back to the left-hand side
+        ax_n.patch.set_visible(False)
+        ax_n.yaxis.set_label_position("right")
+        ax_n.yaxis.tick_right()
         ax.plot(day_df["__timestamp"], day_df["ozone"], marker="o", linestyle="-", color="#1f77b4", label="Ozone")
+
+        for name, label, color in NITROGEN_STYLES:
+            if name in day_df.columns and day_df[name].notna().any():
+                ax_n.plot(day_df["__timestamp"], day_df[name], linestyle="-", linewidth=1.2,
+                          color=color, label=label)
 
         selected_date = datetime.fromisoformat(selected).date()
         excel_day = df_excel[df_excel["__date"] == selected_date]
         if not excel_day.empty:
-            first_label = True
+            endtime_labeled = False
+            peak_labeled = False
             injection_cols = [c for c in excel_day.columns if c.lower().endswith("_injectiontime")]
             for endtime in excel_day[ENDTIME_COLUMN].dropna().unique():
                 ax.axvline(endtime, color="#ff7f0e", linestyle="--", linewidth=2,
-                           label="Endtime_UTC" if first_label else None)
-                first_label = False
+                           label="Endtime_UTC" if not endtime_labeled else None)
+                endtime_labeled = True
 
                 before = day_df[day_df["__timestamp"] < endtime].copy()
                 before = before.dropna(subset=["ozone"])
@@ -470,8 +495,8 @@ def create_tab1(frame):
                     idxmax = before["ozone"].idxmax()
                     peak_row = before.loc[idxmax]
                     ax.scatter([peak_row["__timestamp"]], [peak_row["ozone"]], color="red", s=60, zorder=5,
-                               label="Peak before Endtime" if first_label else None)
-                    first_label = False
+                               label="Peak before Endtime" if not peak_labeled else None)
+                    peak_labeled = True
 
             injection_times = []
             for _, row in excel_day.iterrows():
@@ -489,12 +514,15 @@ def create_tab1(frame):
                            label="roof open" if not roof_open_labeled else None)
                 roof_open_labeled = True
 
-        ax.set_title(f"Ozone time series for {selected}")
+        ax.set_title(f"Ozone and NOx time series for {selected}")
         ax.set_xlabel("Time")
         ax.set_ylabel("Ozone")
+        ax_n.set_ylabel("NO / NO2 / NOx")
         ax.grid(True, linestyle="--", alpha=0.4)
-        if not excel_day.empty:
-            ax.legend()
+        handles, labels = ax.get_legend_handles_labels()
+        n_handles, n_labels = ax_n.get_legend_handles_labels()
+        if handles or n_handles:
+            ax.legend(handles + n_handles, labels + n_labels, loc="upper left", fontsize=8)
         fig.autofmt_xdate(rotation=25)
         canvas.draw()
 
