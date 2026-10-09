@@ -1,9 +1,10 @@
 import io
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -81,6 +82,16 @@ CSV_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_AMSandTracegas
 EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OH_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\OHreactivity.csv"
 TVOC_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_kOH.csv"
+KOH_MAX_GAP = pd.Timedelta("30min")
+ROX_PATH =r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_ROx.csv"
+ROX_COLUMNS = ["OH_LIF", "HO2_LIF", "RO2_LIF"]
+ROX_EXPORT_NAME = "merged_Rox_koh_nox_ozone_10min.csv"
+# figure name -> (x column, x label, colour column, colour label)
+ROX_FIGURES = {
+    f"OPR vs. {x_name} (colored by {species})": (x_col, x_label, f"{species}_LIF", f"{species} (molecules cm-3)")
+    for x_name, x_col, x_label in [("TVOC", "tvoc_s1", "TVOC (s-1)"), ("NOx", "nox", "NOx (ppb)")]
+    for species in ["HO2", "RO2", "OH"]
+}
 TARGET_DATES = [
     "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
     "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
@@ -314,8 +325,56 @@ def load_tvoc_dataset(path):
     return df.dropna(subset=["__timestamp"]).sort_values("__timestamp").reset_index(drop=True)
 
 
-def compute_tab2_10min_data(df, df_excel, tvoc_df):
+def load_rox_dataset(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"ROx file not found: {path}")
+
+    df = pd.read_csv(path, usecols=lambda c: c == "time" or c in ROX_COLUMNS, low_memory=False)
+    if df.empty:
+        raise ValueError("ROx file is empty")
+    missing = [c for c in ["time"] + ROX_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"ROx file missing required columns: {', '.join(missing)}")
+
+    df["__timestamp"] = pd.to_datetime(df["time"], errors="coerce")
+    if df["__timestamp"].isna().all():
+        raise ValueError("Could not parse any timestamps from the ROx file")
+
+    for col in ROX_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # negative concentrations are below detection limit noise; drop the value, keep the row's other species
+        df.loc[df[col] < 0, col] = float("nan")
+    df = df[["__timestamp"] + ROX_COLUMNS].dropna(subset=["__timestamp"])
+    return df.sort_values("__timestamp").reset_index(drop=True)
+
+
+def _resample_10min(df, columns):
+    series = df.set_index("__timestamp")[columns]
+    # files parse at different datetime resolutions; align them so the 10-min bins join exactly
+    series.index = series.index.astype("datetime64[ns]")
+    return series.resample("10min").mean()
+
+
+def _interpolate_koh(tvoc_df, times):
+    # kOH is sampled only every ~6-14 min, so many 10-min windows hold no sample; interpolate linearly
+    # in time instead, but not across gaps longer than KOH_MAX_GAP (instrument off, between days)
+    koh = tvoc_df[["__timestamp", "kOH"]].dropna()
+    t = koh["__timestamp"].astype("datetime64[ns]").astype("int64").to_numpy()
+    v = koh["kOH"].to_numpy()
+    x = pd.DatetimeIndex(times).astype("datetime64[ns]").asi8
+    values = np.interp(x, t, v, left=np.nan, right=np.nan)
+
+    hi = np.clip(np.searchsorted(t, x), 1, len(t) - 1)
+    gap = t[hi] - t[hi - 1]
+    exact = t[hi] == x
+    values[(gap > KOH_MAX_GAP.value) & ~exact] = np.nan
+    return values
+
+
+def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
     rows = []
+    # ROx is averaged into the same 10-min windows as ozone and NOx; kOH is interpolated to the window centres
+    rox_10min = _resample_10min(rox_df, ROX_COLUMNS) if rox_df is not None else None
 
     for date_string in TARGET_DATES:
         date_obj = datetime.fromisoformat(date_string).date()
@@ -354,24 +413,15 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df):
         if "nox" not in day_df.columns:
             continue
 
-        resampled = (
-            day_df.set_index("__timestamp")[['ozone', 'nox']]
-            .resample('10min')
-            .mean()
-            .dropna(how='all')
-        )
+        resampled = _resample_10min(day_df, ["ozone", "nox"]).dropna(how="all")
         resampled = resampled[(resampled.index > roof_open) & (resampled.index <= peak_time)]
         if resampled.empty:
             continue
 
-        tvoc_series = tvoc_df.set_index("__timestamp")[["kOH"]]
-        merged = pd.merge_asof(
-            resampled.reset_index().sort_values("__timestamp"),
-            tvoc_series.reset_index().sort_values("__timestamp"),
-            on="__timestamp",
-            direction="nearest",
-            tolerance=pd.Timedelta("10min"),
-        )
+        resampled["kOH"] = _interpolate_koh(tvoc_df, resampled.index + pd.Timedelta("5min"))
+        if rox_10min is not None:
+            resampled = resampled.join(rox_10min, how="left")
+        merged = resampled.rename_axis("__timestamp").reset_index()
 
         for _, row in merged.iterrows():
             if pd.isna(row["kOH"]) or pd.isna(row["ozone"]) or pd.isna(row["nox"]):
@@ -382,13 +432,18 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df):
                 continue
 
             opr_ppbv_h = (row["ozone"] - background_ozone) / elapsed_hr
-            rows.append({
+            out_row = {
                 "date": date_obj,
                 "timestamp": row["__timestamp"],
                 "opr_ppbv_h": opr_ppbv_h,
                 "tvoc_s1": row["kOH"],
                 "nox": row["nox"],
-            })
+            }
+            if rox_df is not None:
+                out_row["ozone"] = row["ozone"]
+                for col in ROX_COLUMNS:
+                    out_row[col] = row[col]
+            rows.append(out_row)
 
     return pd.DataFrame(rows)
 
@@ -585,7 +640,10 @@ def create_tab2(frame):
     file_label.pack(anchor="w", padx=10, pady=(10, 0))
 
     file_label2 = ttk.Label(frame, text=f"TVOC file: {TVOC_PATH}")
-    file_label2.pack(anchor="w", padx=10, pady=(0, 10))
+    file_label2.pack(anchor="w", padx=10, pady=(0, 0))
+
+    file_label3 = ttk.Label(frame, text=f"ROx file: {ROX_PATH}")
+    file_label3.pack(anchor="w", padx=10, pady=(0, 10))
 
     control_frame = ttk.Frame(frame)
     control_frame.pack(fill="x", padx=10, pady=10)
@@ -601,8 +659,9 @@ def create_tab2(frame):
             "OPR for each experiment",
             "OPR vs. TVOC",
             "NOx vs. TVOC",
+            *ROX_FIGURES,
         ],
-        width=30,
+        width=40,
     )
     figure_combo.grid(row=0, column=1, padx=(8, 0), sticky="w")
     figure_combo.current(0)
@@ -613,7 +672,9 @@ def create_tab2(frame):
     button_frame = ttk.Frame(frame)
     button_frame.pack(fill="x", padx=10, pady=(0, 8))
     clipboard_button = ttk.Button(button_frame, text="Copy figure to clipboard")
-    clipboard_button.pack(anchor="w")
+    clipboard_button.pack(side="left")
+    download_button = ttk.Button(button_frame, text="Download merged ROx/kOH/NOx/ozone 10-min CSV")
+    download_button.pack(side="left", padx=(10, 0))
 
     fig = Figure(figsize=(8, 4), dpi=100)
     ax = fig.add_subplot(111)
@@ -626,10 +687,12 @@ def create_tab2(frame):
         df_excel = load_excel_dataset(EXCEL_PATH)
         df_oh = load_oh_reactivity(OH_PATH)
         tvoc_df = load_tvoc_dataset(TVOC_PATH)
+        rox_df = load_rox_dataset(ROX_PATH)
         tab2_data = compute_tab2_data(df, df_excel, df_oh)
-        tab2_10min_data = compute_tab2_10min_data(df, df_excel, tvoc_df)
+        tab2_10min_data = compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df)
     except Exception as exc:
         message_label.config(text=str(exc))
+        download_button.config(state="disabled")
         return
 
     def draw_tab2():
@@ -640,7 +703,31 @@ def create_tab2(frame):
 
         selected = figure_var.get().strip()
 
-        if "Ozone enhancement" in selected:
+        # checked first: these names contain "OPR vs. TVOC", which the branch below would also match
+        if selected in ROX_FIGURES:
+            x_col, x_label, c_col, c_label = ROX_FIGURES[selected]
+            plot_data = tab2_10min_data.dropna(subset=[x_col, "opr_ppbv_h", c_col]) if not tab2_10min_data.empty else tab2_10min_data
+            if plot_data.empty:
+                message_label.config(text=f"No valid 10-minute OPR data with {c_col} available.")
+                canvas.draw()
+                return
+            message_label.config(text="")
+            ax.set_title(selected)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel("OPR (ppbv/h)")
+            scatter = ax.scatter(
+                plot_data[x_col],
+                plot_data["opr_ppbv_h"],
+                c=plot_data[c_col],
+                cmap="YlOrRd",
+                s=40,
+                edgecolor="black",
+                linewidth=0.2,
+            )
+            current_cbar = fig.colorbar(scatter, ax=ax)
+            current_cbar.set_label(c_label)
+
+        elif "Ozone enhancement" in selected:
             if tab2_data.empty:
                 message_label.config(text="No valid experiment-level data available.")
                 canvas.draw()
@@ -790,7 +877,28 @@ def create_tab2(frame):
         except Exception as exc:
             messagebox.showerror("Clipboard error", str(exc))
 
+    def download_merged_csv():
+        if tab2_10min_data.empty:
+            messagebox.showinfo("No data", "No 10-minute merged data to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save merged 10-minute data",
+            initialdir=os.path.dirname(ROX_PATH),
+            initialfile=ROX_EXPORT_NAME,
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        export = tab2_10min_data.rename(columns={"tvoc_s1": "kOH"})
+        try:
+            export.to_csv(path, index=False)
+            messagebox.showinfo("Saved", f"Saved {len(export)} rows to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Save error", str(exc))
+
     clipboard_button.config(command=copy_figure_to_clipboard)
+    download_button.config(command=download_merged_csv)
     figure_var.trace_add('write', lambda *args: draw_tab2())
     draw_tab2()
 

@@ -25,4 +25,4 @@ print(tvoc_10min.head(20))
 print(len(tvoc_10min))
 
 tvoc_10min.to_csv(os.path.join(out_dir, "tvoc_koh_10min.csv"), index=False)
-merged.to_csv(os.path.join(out_dir, "merged_koh_nox_ozone_10min.csv"), index=False)
+#merged.to_csv(os.path.join(out_dir, "merged_koh_nox_ozone_10min.csv"), index=False)
