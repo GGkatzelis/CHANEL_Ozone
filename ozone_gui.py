@@ -4,9 +4,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 
+import matplotlib
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 from matplotlib.figure import Figure
 
 try:
@@ -83,15 +86,29 @@ EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OH_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\OHreactivity.csv"
 TVOC_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_kOH.csv"
 KOH_MAX_GAP = pd.Timedelta("30min")
+# marker area (pt^2) of the 10-min scatter points at roof open and at the longest time after it
+POINT_SIZE_MAX = 140
+POINT_SIZE_MIN = 12
+DAY_EDGE_CMAP = matplotlib.colormaps["tab10"]
+# chosen edge colours per day; days not listed here fall back to DAY_EDGE_CMAP
+DAY_EDGE_COLORS = {
+    "2024-07-10": "#9B3F5C",
+    "2024-07-11": "#6EA27E",
+    "2024-07-22": "#D3968C",
+    "2024-07-29": "#988CB7",
+    "2024-07-30": "#8096AD",
+}
+DAY_EDGE_WIDTH = 1.4
 ROX_PATH =r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_ROx.csv"
 ROX_COLUMNS = ["OH_LIF", "HO2_LIF", "RO2_LIF"]
 ROX_EXPORT_NAME = "merged_Rox_koh_nox_ozone_10min.csv"
 # figure name -> (x column, x label, colour column, colour label)
-ROX_FIGURES = {
+OPR_10MIN_FIGURES = {
     f"OPR vs. {x_name} (colored by {species})": (x_col, x_label, f"{species}_LIF", f"{species} (molecules cm-3)")
     for x_name, x_col, x_label in [("TVOC", "tvoc_s1", "TVOC (s-1)"), ("NOx", "nox", "NOx (ppb)")]
     for species in ["HO2", "RO2", "OH"]
 }
+OPR_10MIN_FIGURES["OPR vs. NOx (colored by TVOC)"] = ("nox", "NOx (ppb)", "tvoc_s1", "TVOC (s-1)")
 TARGET_DATES = [
     "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
     "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
@@ -435,6 +452,7 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
             out_row = {
                 "date": date_obj,
                 "timestamp": row["__timestamp"],
+                "elapsed_h": elapsed_hr,
                 "opr_ppbv_h": opr_ppbv_h,
                 "tvoc_s1": row["kOH"],
                 "nox": row["nox"],
@@ -659,7 +677,7 @@ def create_tab2(frame):
             "OPR for each experiment",
             "OPR vs. TVOC",
             "NOx vs. TVOC",
-            *ROX_FIGURES,
+            *OPR_10MIN_FIGURES,
         ],
         width=40,
     )
@@ -681,6 +699,10 @@ def create_tab2(frame):
     canvas = FigureCanvasTkAgg(fig, master=frame)
     canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
     current_cbar = None
+    # hover tooltip state for the 10-min scatter figures; reset on every redraw
+    hover_scatter = None
+    hover_labels = []
+    hover_annot = None
 
     try:
         df = load_dataset(CSV_PATH)
@@ -695,20 +717,65 @@ def create_tab2(frame):
         download_button.config(state="disabled")
         return
 
+    def window_labels(data):
+        starts = pd.to_datetime(data["timestamp"])
+        return [f"{s:%Y-%m-%d %H:%M}–{s + timedelta(minutes=10):%H:%M}" for s in starts]
+
+    # 10-min points shrink with time since roof open; one scale for all figures so sizes compare across them
+    size_max_h = tab2_10min_data["elapsed_h"].max() if not tab2_10min_data.empty else 1.0
+
+    def point_sizes(elapsed_h):
+        fraction = (np.asarray(elapsed_h, dtype=float) / size_max_h).clip(0, 1)
+        return POINT_SIZE_MAX - (POINT_SIZE_MAX - POINT_SIZE_MIN) * fraction
+
+    def add_size_legend():
+        hours = [h for h in MaxNLocator(nbins=4).tick_values(0, size_max_h) if 0 < h <= size_max_h]
+        handles = [
+            Line2D([], [], linestyle="", marker="o", markersize=np.sqrt(point_sizes(h)),
+                   markerfacecolor="lightgray", markeredgecolor="black", markeredgewidth=0.5)
+            for h in hours
+        ]
+        ax.legend(handles, [f"{h:g} h" for h in hours], title="Time since roof open",
+                  loc="best", fontsize=8, title_fontsize=8, labelspacing=1.0, borderpad=0.8)
+
+    # one fixed edge colour per experiment day, so a day keeps its colour in every figure
+    day_colors = {
+        datetime.fromisoformat(d).date(): DAY_EDGE_COLORS.get(d, DAY_EDGE_CMAP(i % DAY_EDGE_CMAP.N))
+        for i, d in enumerate(TARGET_DATES)
+    }
+
+    def day_edge_colors(data):
+        return [day_colors.get(d, "black") for d in data["date"]]
+
+    def add_day_legend(data):
+        # placed in the strip reserved right of the colour bar, so it never covers data
+        days = [d for d in day_colors if d in set(data["date"])]
+        handles = [
+            Line2D([], [], linestyle="", marker="o", markersize=8, markerfacecolor="white",
+                   markeredgecolor=day_colors[d], markeredgewidth=2.0)
+            for d in days
+        ]
+        fig.legend(handles, [d.isoformat() for d in days], title="Experiment",
+                   loc="center right", fontsize=8, title_fontsize=8, frameon=False)
+
     def draw_tab2():
-        nonlocal current_cbar, ax
+        nonlocal current_cbar, ax, hover_scatter, hover_labels, hover_annot
         fig.clear()
         ax = fig.add_subplot(111)
         current_cbar = None
+        hover_scatter = None
+        hover_labels = []
+        hover_annot = None
 
         selected = figure_var.get().strip()
+        day_legend_data = None
 
         # checked first: these names contain "OPR vs. TVOC", which the branch below would also match
-        if selected in ROX_FIGURES:
-            x_col, x_label, c_col, c_label = ROX_FIGURES[selected]
+        if selected in OPR_10MIN_FIGURES:
+            x_col, x_label, c_col, c_label = OPR_10MIN_FIGURES[selected]
             plot_data = tab2_10min_data.dropna(subset=[x_col, "opr_ppbv_h", c_col]) if not tab2_10min_data.empty else tab2_10min_data
             if plot_data.empty:
-                message_label.config(text=f"No valid 10-minute OPR data with {c_col} available.")
+                message_label.config(text=f"No valid 10-minute OPR data with {c_label} available.")
                 canvas.draw()
                 return
             message_label.config(text="")
@@ -720,12 +787,15 @@ def create_tab2(frame):
                 plot_data["opr_ppbv_h"],
                 c=plot_data[c_col],
                 cmap="YlOrRd",
-                s=40,
-                edgecolor="black",
-                linewidth=0.2,
+                s=point_sizes(plot_data["elapsed_h"]),
+                edgecolor=day_edge_colors(plot_data),
+                linewidth=DAY_EDGE_WIDTH,
             )
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label(c_label)
+            add_size_legend()
+            day_legend_data = plot_data
+            hover_scatter, hover_labels = scatter, window_labels(plot_data)
 
         elif "Ozone enhancement" in selected:
             if tab2_data.empty:
@@ -801,12 +871,15 @@ def create_tab2(frame):
                 tab2_10min_data["opr_ppbv_h"],
                 c=tab2_10min_data["nox"],
                 cmap="YlOrRd",
-                s=40,
-                edgecolor="black",
-                linewidth=0.2,
+                s=point_sizes(tab2_10min_data["elapsed_h"]),
+                edgecolor=day_edge_colors(tab2_10min_data),
+                linewidth=DAY_EDGE_WIDTH,
             )
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label("NOx (ppb)")
+            add_size_legend()
+            day_legend_data = tab2_10min_data
+            hover_scatter, hover_labels = scatter, window_labels(tab2_10min_data)
 
         elif "NOx vs. TVOC" in selected:
             if tab2_10min_data.empty:
@@ -822,12 +895,15 @@ def create_tab2(frame):
                 tab2_10min_data["nox"],
                 c=tab2_10min_data["opr_ppbv_h"],
                 cmap="YlOrRd",
-                s=40,
-                edgecolor="black",
-                linewidth=0.2,
+                s=point_sizes(tab2_10min_data["elapsed_h"]),
+                edgecolor=day_edge_colors(tab2_10min_data),
+                linewidth=DAY_EDGE_WIDTH,
             )
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label("OPR (ppbv/h)")
+            add_size_legend()
+            day_legend_data = tab2_10min_data
+            hover_scatter, hover_labels = scatter, window_labels(tab2_10min_data)
 
             x_min = 0
             x_max = 100
@@ -847,9 +923,45 @@ def create_tab2(frame):
             ax.set_xlim(0, 100)
             ax.set_ylim(0, 8)
 
-        ax.grid(True, linestyle="--", alpha=0.4)
-        fig.tight_layout()
+        # only the per-experiment figures keep a grid; the 10-min scatter figures are drawn without one
+        if "for each experiment" in selected:
+            ax.grid(True, linestyle="--", alpha=0.4)
+        if day_legend_data is not None:
+            add_day_legend(day_legend_data)
+            fig.tight_layout(rect=(0, 0, 0.87, 1))
+        else:
+            fig.tight_layout()
+        if hover_scatter is not None:
+            hover_annot = ax.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(10, 10),
+                textcoords="offset points",
+                fontsize=8,
+                bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9),
+            )
+            hover_annot.set_visible(False)
         canvas.draw()
+
+    def on_hover(event):
+        if hover_scatter is None or hover_annot is None:
+            return
+        hit, info = (False, {})
+        if event.inaxes is hover_scatter.axes:
+            hit, info = hover_scatter.contains(event)
+        if hit:
+            # markers overlap, so of all points under the cursor pick the one whose centre is closest
+            offsets = hover_scatter.get_offsets()
+            hits = info["ind"]
+            pixels = hover_scatter.axes.transData.transform(offsets[hits])
+            idx = hits[np.argmin(np.hypot(pixels[:, 0] - event.x, pixels[:, 1] - event.y))]
+            hover_annot.xy = offsets[idx]
+            hover_annot.set_text(hover_labels[idx])
+            hover_annot.set_visible(True)
+            canvas.draw_idle()
+        elif hover_annot.get_visible():
+            hover_annot.set_visible(False)
+            canvas.draw_idle()
 
     def copy_figure_to_clipboard():
         if Image is None:
@@ -899,6 +1011,7 @@ def create_tab2(frame):
 
     clipboard_button.config(command=copy_figure_to_clipboard)
     download_button.config(command=download_merged_csv)
+    canvas.mpl_connect("motion_notify_event", on_hover)
     figure_var.trace_add('write', lambda *args: draw_tab2())
     draw_tab2()
 
