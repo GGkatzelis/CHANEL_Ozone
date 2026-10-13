@@ -99,6 +99,19 @@ DAY_EDGE_COLORS = {
     "2024-07-30": "#8096AD",
 }
 DAY_EDGE_WIDTH = 1.4
+# experiment description shown in the figure legends instead of the date
+EXPERIMENT_LABELS = {
+    "2024-07-08": "VCPs, medium NO",
+    "2024-07-09": "VCPs, high NO",
+    "2024-07-10": "gasoline, high NO",
+    "2024-07-11": "gasoline, medium NO",
+    "2024-07-15": "cooking, medium NO",
+    "2024-07-17": "diesel, medium NO",
+    "2024-07-18": "diesel, high NO",
+    "2024-07-22": "LA Anthropogenic, medium NO",
+    "2024-07-29": "LA Anthropogenic+Biogenic, medium NO",
+    "2024-07-30": "Global Anthropogenic, medium NO",
+}
 ROX_PATH =r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_ROx.csv"
 ROX_COLUMNS = ["OH_LIF", "HO2_LIF", "RO2_LIF"]
 ROX_EXPORT_NAME = "merged_Rox_koh_nox_ozone_10min.csv"
@@ -675,7 +688,7 @@ def create_tab2(frame):
         values=[
             "Ozone enhancement for each experiment",
             "OPR for each experiment",
-            "OPR vs. TVOC",
+            "OPR vs. TVOC (colored by NOx)",
             "NOx vs. TVOC",
             *OPR_10MIN_FIGURES,
         ],
@@ -755,8 +768,11 @@ def create_tab2(frame):
                    markeredgecolor=day_colors[d], markeredgewidth=2.0)
             for d in days
         ]
-        fig.legend(handles, [d.isoformat() for d in days], title="Experiment",
-                   loc="center right", fontsize=8, title_fontsize=8, frameon=False)
+        legend = fig.legend(handles, [EXPERIMENT_LABELS.get(d.isoformat(), d.isoformat()) for d in days],
+                            title="Experiment", loc="center right", fontsize=8, title_fontsize=8, frameon=False)
+        # fraction of the figure width the legend needs, so the plot can be squeezed to make room for it
+        width = legend.get_window_extent(fig.canvas.get_renderer()).width
+        return min(width / fig.bbox.width + 0.01, 0.5)
 
     def draw_tab2():
         nonlocal current_cbar, ax, hover_scatter, hover_labels, hover_annot
@@ -770,7 +786,6 @@ def create_tab2(frame):
         selected = figure_var.get().strip()
         day_legend_data = None
 
-        # checked first: these names contain "OPR vs. TVOC", which the branch below would also match
         if selected in OPR_10MIN_FIGURES:
             x_col, x_label, c_col, c_label = OPR_10MIN_FIGURES[selected]
             plot_data = tab2_10min_data.dropna(subset=[x_col, "opr_ppbv_h", c_col]) if not tab2_10min_data.empty else tab2_10min_data
@@ -857,13 +872,13 @@ def create_tab2(frame):
             current_cbar = fig.colorbar(scatter, ax=ax)
             current_cbar.set_label("NOx avg (ppb)")
 
-        elif "OPR vs. TVOC" in selected:
+        elif selected == "OPR vs. TVOC (colored by NOx)":
             if tab2_10min_data.empty:
                 message_label.config(text="No valid 10-minute OPR data available.")
                 canvas.draw()
                 return
             message_label.config(text="")
-            ax.set_title("OPR vs. TVOC")
+            ax.set_title("OPR vs. TVOC (colored by NOx)")
             ax.set_xlabel("TVOC (s-1)")
             ax.set_ylabel("OPR (ppbv/h)")
             scatter = ax.scatter(
@@ -927,8 +942,8 @@ def create_tab2(frame):
         if "for each experiment" in selected:
             ax.grid(True, linestyle="--", alpha=0.4)
         if day_legend_data is not None:
-            add_day_legend(day_legend_data)
-            fig.tight_layout(rect=(0, 0, 0.87, 1))
+            legend_fraction = add_day_legend(day_legend_data)
+            fig.tight_layout(rect=(0, 0, 1 - legend_fraction, 1))
         else:
             fig.tight_layout()
         if hover_scatter is not None:
