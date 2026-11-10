@@ -86,6 +86,7 @@ EXCEL_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\updated_file.xlsx"
 OH_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\OHreactivity.csv"
 TVOC_PATH = r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_kOH.csv"
 KOH_MAX_GAP = pd.Timedelta("30min")
+BIN_WIDTH = pd.Timedelta("10min")
 # marker area (pt^2) of the 10-min scatter points at roof open and at the longest time after it
 POINT_SIZE_MAX = 140
 POINT_SIZE_MIN = 12
@@ -382,7 +383,7 @@ def _resample_10min(df, columns):
     series = df.set_index("__timestamp")[columns]
     # files parse at different datetime resolutions; align them so the 10-min bins join exactly
     series.index = series.index.astype("datetime64[ns]")
-    return series.resample("10min").mean()
+    return series.resample(BIN_WIDTH).mean()
 
 
 def _interpolate_koh(tvoc_df, times):
@@ -421,10 +422,9 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
             continue
 
         roof_open = min(roof_open_times)
+        # mean ozone in the hour before roof open, treated as the ozone value at roof open
         background_start = roof_open - timedelta(hours=1)
         background_period = day_df[(day_df["__timestamp"] >= background_start) & (day_df["__timestamp"] <= roof_open)]
-        if background_period.empty:
-            continue
         background_ozone = background_period["ozone"].mean()
 
         peak_rows = []
@@ -448,25 +448,37 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
         if resampled.empty:
             continue
 
-        resampled["kOH"] = _interpolate_koh(tvoc_df, resampled.index + pd.Timedelta("5min"))
+        # OPR is the local slope to the previous bin that has ozone: (O3_i - O3_prev) / (t_i - t_prev), with
+        # times at bin centres. Empty bins are skipped, so the step becomes 20, 30, ... min instead of losing
+        # the point. The first bin is referenced to the background ozone at roof open.
+        ozone = resampled["ozone"].dropna()
+        times = pd.Series(ozone.index + BIN_WIDTH / 2, index=ozone.index)
+        prev_ozone = ozone.shift(1)
+        prev_time = times.shift(1)
+        if not ozone.empty:
+            prev_ozone.iloc[0] = background_ozone  # NaN if there was no background data
+            prev_time.iloc[0] = roof_open
+        resampled["opr_ppbv_h"] = (ozone - prev_ozone) / ((times - prev_time) / pd.Timedelta("1h"))
+
+        resampled["kOH"] = _interpolate_koh(tvoc_df, resampled.index + BIN_WIDTH / 2)
         if rox_10min is not None:
             resampled = resampled.join(rox_10min, how="left")
         merged = resampled.rename_axis("__timestamp").reset_index()
 
         for _, row in merged.iterrows():
-            if pd.isna(row["kOH"]) or pd.isna(row["ozone"]) or pd.isna(row["nox"]):
+            if pd.isna(row["kOH"]) or pd.isna(row["opr_ppbv_h"]) or pd.isna(row["nox"]):
                 continue
 
-            elapsed_hr = (row["__timestamp"] - roof_open).total_seconds() / 3600.0
+            # bins are labelled by their start, but the averaged values represent the bin centre
+            elapsed_hr = (row["__timestamp"] + BIN_WIDTH / 2 - roof_open).total_seconds() / 3600.0
             if elapsed_hr <= 0:
                 continue
 
-            opr_ppbv_h = (row["ozone"] - background_ozone) / elapsed_hr
             out_row = {
                 "date": date_obj,
                 "timestamp": row["__timestamp"],
                 "elapsed_h": elapsed_hr,
-                "opr_ppbv_h": opr_ppbv_h,
+                "opr_ppbv_h": row["opr_ppbv_h"],
                 "tvoc_s1": row["kOH"],
                 "nox": row["nox"],
             }
