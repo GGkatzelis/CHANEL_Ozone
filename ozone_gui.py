@@ -91,13 +91,19 @@ BIN_WIDTH = pd.Timedelta("10min")
 POINT_SIZE_MAX = 140
 POINT_SIZE_MIN = 12
 DAY_EDGE_CMAP = matplotlib.colormaps["tab10"]
-# chosen edge colours per day; days not listed here fall back to DAY_EDGE_CMAP
+# chosen edge colours per day; days not listed here fall back to DAY_EDGE_CMAP. Picked so every pair is
+# >= 40 CIELAB dE apart and every colour is >= 50 dE from the YlOrRd fill colormap (no yellows/oranges/reds)
 DAY_EDGE_COLORS = {
-    "2024-07-10": "#9B3F5C",
-    "2024-07-11": "#6EA27E",
-    "2024-07-22": "#D3968C",
-    "2024-07-29": "#988CB7",
-    "2024-07-30": "#8096AD",
+    "2024-07-08": "#1f77b4",  # blue
+    "2024-07-09": "#000080",  # navy
+    "2024-07-10": "#ff00ff",  # magenta
+    "2024-07-11": "#988CB7",  # lavender
+    "2024-07-15": "#000000",  # black
+    "2024-07-17": "#006400",  # dark green
+    "2024-07-18": "#00e5ff",  # aqua
+    "2024-07-22": "#e377c2",  # pink
+    "2024-07-29": "#3cd6a0",  # mint
+    "2024-07-30": "#008080",  # teal
 }
 DAY_EDGE_WIDTH = 1.4
 # experiment description shown in the figure legends instead of the date
@@ -116,11 +122,18 @@ EXPERIMENT_LABELS = {
 ROX_PATH =r"Z:\VOC\Campaigns\2024 CHANEL\Ozone\CHANEL_DataUpload_ROx.csv"
 ROX_COLUMNS = ["OH_LIF", "HO2_LIF", "RO2_LIF"]
 ROX_EXPORT_NAME = "merged_Rox_koh_nox_ozone_10min.csv"
+# colour-by name -> (colour column, colour label); HO2/RO2 turnover = HO2/RO2 * NO and OH turnover = OH * TVOC
+# (kOH), from the 10-min values of each
+ROX_COLOR_BY = [
+    ("HO2 turnover", "HO2_turnover", "HO2 turnover"),
+    ("RO2 turnover", "RO2_turnover", "RO2 turnover"),
+    ("OH turnover", "OH_turnover", "OH turnover"),
+]
 # figure name -> (x column, x label, colour column, colour label)
 OPR_10MIN_FIGURES = {
-    f"OPR vs. {x_name} (colored by {species})": (x_col, x_label, f"{species}_LIF", f"{species} (molecules cm-3)")
+    f"OPR vs. {x_name} (colored by {c_name})": (x_col, x_label, c_col, c_label)
     for x_name, x_col, x_label in [("TVOC", "tvoc_s1", "TVOC (s-1)"), ("NOx", "nox", "NOx (ppb)")]
-    for species in ["HO2", "RO2", "OH"]
+    for c_name, c_col, c_label in ROX_COLOR_BY
 }
 OPR_10MIN_FIGURES["OPR vs. NOx (colored by TVOC)"] = ("nox", "NOx (ppb)", "tvoc_s1", "TVOC (s-1)")
 TARGET_DATES = [
@@ -443,7 +456,10 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
         if "nox" not in day_df.columns:
             continue
 
-        resampled = _resample_10min(day_df, ["ozone", "nox"]).dropna(how="all")
+        no_cols = ["no"] if "no" in day_df.columns else []
+        resampled = _resample_10min(day_df, ["ozone", "nox"] + no_cols).dropna(how="all")
+        if "no" not in resampled.columns:
+            resampled["no"] = np.nan
         resampled = resampled[(resampled.index > roof_open) & (resampled.index <= peak_time)]
         if resampled.empty:
             continue
@@ -484,8 +500,12 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
             }
             if rox_df is not None:
                 out_row["ozone"] = row["ozone"]
+                out_row["no"] = row["no"]
                 for col in ROX_COLUMNS:
                     out_row[col] = row[col]
+                out_row["HO2_turnover"] = row["HO2_LIF"] * row["no"]
+                out_row["RO2_turnover"] = row["RO2_LIF"] * row["no"]
+                out_row["OH_turnover"] = row["OH_LIF"] * row["kOH"]
             rows.append(out_row)
 
     return pd.DataFrame(rows)
