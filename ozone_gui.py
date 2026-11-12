@@ -129,6 +129,12 @@ ROX_COLOR_BY = [
     ("RO2 turnover", "RO2_turnover", "RO2 turnover"),
     ("OH turnover", "OH_turnover", "OH turnover"),
 ]
+# upper limit of the colour bar per colour column; higher values all get the top colour (arrow on the bar).
+# A few 07-10 points reach ~1e9 while ~93% of HO2 turnover is below 5e8, so without a cap most points look alike
+COLOR_VMAX = {"HO2_turnover": 5e8}
+# lower limit of the colour bar per colour column; lower values all get the bottom colour (arrow on the bar).
+# ~90% of j_HONO is above 4.6e-4, so a few late-afternoon points down to ~2.6e-4 would otherwise compress the scale
+COLOR_VMIN = {"j_hono": 4e-4}
 # figure name -> (x column, x label, colour column, colour label)
 OPR_10MIN_FIGURES = {
     f"OPR vs. {x_name} (colored by {c_name})": (x_col, x_label, c_col, c_label)
@@ -136,6 +142,8 @@ OPR_10MIN_FIGURES = {
     for c_name, c_col, c_label in ROX_COLOR_BY
 }
 OPR_10MIN_FIGURES["OPR vs. NOx (colored by TVOC)"] = ("nox", "NOx (ppb)", "tvoc_s1", "TVOC (s-1)")
+OPR_10MIN_FIGURES["OPR vs. TVOC (colored by j_HONO)"] = ("tvoc_s1", "TVOC (s-1)", "j_hono", "j_HONO (s-1)")
+OPR_10MIN_FIGURES["OPR vs. NOx (colored by j_HONO)"] = ("nox", "NOx (ppb)", "j_hono", "j_HONO (s-1)")
 TARGET_DATES = [
     "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
     "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
@@ -152,6 +160,7 @@ NITROGEN_STYLES = [
     ("no", "NO", "#8c564b"),
     ("no2", "NO2", "#e377c2"),
 ]
+JHONO_COLUMN = "jHONO_SR.FZJ"  # HONO photolysis frequency (s-1), loaded as "j_hono"
 ENDTIME_COLUMN = "Endtime_UTC"
 REACTIONTIME_COLUMN = "reactiontime_UTC"
 
@@ -219,12 +228,17 @@ def load_dataset(path):
     columns = [ozone_col]
     present_nitrogen = [c for c in NITROGEN_COLUMNS if c in df.columns]
     columns.extend(present_nitrogen)
+    has_jhono = JHONO_COLUMN in df.columns
+    if has_jhono:
+        columns.append(JHONO_COLUMN)
 
     df = df[columns].copy()
     df.insert(0, "__timestamp", timestamps)
-    df = df.rename(columns={ozone_col: "ozone", **NITROGEN_COLUMNS})
+    df = df.rename(columns={ozone_col: "ozone", JHONO_COLUMN: "j_hono", **NITROGEN_COLUMNS})
     for name in (NITROGEN_COLUMNS[c] for c in present_nitrogen):
         df[name] = pd.to_numeric(df[name], errors="coerce")
+    if has_jhono:
+        df["j_hono"] = pd.to_numeric(df["j_hono"], errors="coerce")
 
     df = df.sort_values("__timestamp").reset_index(drop=True)
     df = df.dropna(subset=["__timestamp"])
@@ -456,10 +470,11 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
         if "nox" not in day_df.columns:
             continue
 
-        no_cols = ["no"] if "no" in day_df.columns else []
-        resampled = _resample_10min(day_df, ["ozone", "nox"] + no_cols).dropna(how="all")
-        if "no" not in resampled.columns:
-            resampled["no"] = np.nan
+        optional_cols = [c for c in ["no", "j_hono"] if c in day_df.columns]
+        resampled = _resample_10min(day_df, ["ozone", "nox"] + optional_cols).dropna(how="all")
+        for c in ["no", "j_hono"]:
+            if c not in resampled.columns:
+                resampled[c] = np.nan
         resampled = resampled[(resampled.index > roof_open) & (resampled.index <= peak_time)]
         if resampled.empty:
             continue
@@ -497,6 +512,7 @@ def compute_tab2_10min_data(df, df_excel, tvoc_df, rox_df=None):
                 "opr_ppbv_h": row["opr_ppbv_h"],
                 "tvoc_s1": row["kOH"],
                 "nox": row["nox"],
+                "j_hono": row["j_hono"],
             }
             if rox_df is not None:
                 out_row["ozone"] = row["ozone"]
@@ -829,16 +845,24 @@ def create_tab2(frame):
             ax.set_title(selected)
             ax.set_xlabel(x_label)
             ax.set_ylabel("OPR (ppbv/h)")
+            vmin = COLOR_VMIN.get(c_col)
+            vmax = COLOR_VMAX.get(c_col)
             scatter = ax.scatter(
                 plot_data[x_col],
                 plot_data["opr_ppbv_h"],
                 c=plot_data[c_col],
                 cmap="YlOrRd",
+                vmin=vmin,
+                vmax=vmax,
                 s=point_sizes(plot_data["elapsed_h"]),
                 edgecolor=day_edge_colors(plot_data),
                 linewidth=DAY_EDGE_WIDTH,
             )
-            current_cbar = fig.colorbar(scatter, ax=ax)
+            clipped_high = vmax is not None and (plot_data[c_col] > vmax).any()
+            clipped_low = vmin is not None and (plot_data[c_col] < vmin).any()
+            extend = {(True, True): "both", (True, False): "min", (False, True): "max"}.get(
+                (clipped_low, clipped_high), "neither")
+            current_cbar = fig.colorbar(scatter, ax=ax, extend=extend)
             current_cbar.set_label(c_label)
             add_size_legend()
             day_legend_data = plot_data
