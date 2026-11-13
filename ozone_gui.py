@@ -91,21 +91,23 @@ BIN_WIDTH = pd.Timedelta("10min")
 POINT_SIZE_MAX = 140
 POINT_SIZE_MIN = 12
 DAY_EDGE_CMAP = matplotlib.colormaps["tab10"]
-# chosen edge colours per day; days not listed here fall back to DAY_EDGE_CMAP. Picked so every pair is
-# >= 40 CIELAB dE apart and every colour is >= 50 dE from the YlOrRd fill colormap (no yellows/oranges/reds)
+# chosen edge colours per day; days not listed here fall back to DAY_EDGE_CMAP
 DAY_EDGE_COLORS = {
     "2024-07-08": "#1f77b4",  # blue
     "2024-07-09": "#000080",  # navy
-    "2024-07-10": "#ff00ff",  # magenta
+    "2024-07-10": "#ff7f0e",  # orange
     "2024-07-11": "#988CB7",  # lavender
-    "2024-07-15": "#000000",  # black
+    "2024-07-15": "#9467bd",  # purple
     "2024-07-17": "#006400",  # dark green
-    "2024-07-18": "#00e5ff",  # aqua
+    "2024-07-18": "#CBE2FE",  # pale blue
     "2024-07-22": "#e377c2",  # pink
-    "2024-07-29": "#3cd6a0",  # mint
-    "2024-07-30": "#008080",  # teal
+    "2024-07-29": "#6EA27E",  # sage green
+    "2024-07-30": "#FFE8F0",  # pale pink
 }
 DAY_EDGE_WIDTH = 1.4
+# experiment legend shown right of the colour bar in tab 2
+DAY_LEGEND_FONT_SIZE = 11
+DAY_LEGEND_MARKER_SIZE = 11
 # experiment description shown in the figure legends instead of the date
 EXPERIMENT_LABELS = {
     "2024-07-08": "VCPs, medium NO",
@@ -144,6 +146,21 @@ OPR_10MIN_FIGURES = {
 OPR_10MIN_FIGURES["OPR vs. NOx (colored by TVOC)"] = ("nox", "NOx (ppb)", "tvoc_s1", "TVOC (s-1)")
 OPR_10MIN_FIGURES["OPR vs. TVOC (colored by j_HONO)"] = ("tvoc_s1", "TVOC (s-1)", "j_hono", "j_HONO (s-1)")
 OPR_10MIN_FIGURES["OPR vs. NOx (colored by j_HONO)"] = ("nox", "NOx (ppb)", "j_hono", "j_HONO (s-1)")
+# these figures swap the encodings: marker size shows j_HONO and the fill colour shows time since roof open
+JHONO_SIZED_FIGURES = {
+    "OPR vs. TVOC (sized by j_HONO, colored by time since roof open)": ("tvoc_s1", "TVOC (s-1)"),
+    "OPR vs. NOx (sized by j_HONO, colored by time since roof open)": ("nox", "NOx (ppb)"),
+}
+for _name, (_x_col, _x_label) in JHONO_SIZED_FIGURES.items():
+    OPR_10MIN_FIGURES[_name] = (_x_col, _x_label, "elapsed_h", "Time since roof open (h)")
+# j_HONO mapped to marker size: smallest marker at this lower end (lower values also get the smallest marker),
+# largest marker at the highest j_HONO in the data
+JHONO_SIZE_MIN = 4.5e-4
+# j_HONO is mapped linearly to marker DIAMETER (not area), so equal j_HONO steps look like equal size steps:
+# the diameter (pt) at JHONO_SIZE_MIN, plus JHONO_DIAMETER_STEP pt for every JHONO_VALUE_STEP s-1 above it
+JHONO_DIAMETER_MIN = 3.2
+JHONO_DIAMETER_STEP = 5.0
+JHONO_VALUE_STEP = 1.5e-4
 TARGET_DATES = [
     "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
     "2024-07-15", "2024-07-17", "2024-07-18", "2024-07-22",
@@ -694,7 +711,8 @@ def create_tab1(frame):
 def build_gui():
     root = tk.Tk()
     root.title("CHANEL Ozone Explorer")
-    root.geometry("980x640")
+    # the figures stretch to fill the window, so this sets their on-screen (and copied-to-clipboard) size
+    root.geometry("1400x900")
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
@@ -740,7 +758,7 @@ def create_tab2(frame):
             "NOx vs. TVOC",
             *OPR_10MIN_FIGURES,
         ],
-        width=40,
+        width=60,
     )
     figure_combo.grid(row=0, column=1, padx=(8, 0), sticky="w")
     figure_combo.current(0)
@@ -755,7 +773,7 @@ def create_tab2(frame):
     download_button = ttk.Button(button_frame, text="Download merged ROx/kOH/NOx/ozone 10-min CSV")
     download_button.pack(side="left", padx=(10, 0))
 
-    fig = Figure(figsize=(8, 4), dpi=100)
+    fig = Figure(figsize=(13, 7.5), dpi=100)
     ax = fig.add_subplot(111)
     canvas = FigureCanvasTkAgg(fig, master=frame)
     canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -799,6 +817,30 @@ def create_tab2(frame):
         ax.legend(handles, [f"{h:g} h" for h in hours], title="Time since roof open",
                   loc="best", fontsize=8, title_fontsize=8, labelspacing=1.0, borderpad=0.8)
 
+    jhono_size_max = tab2_10min_data["j_hono"].max() if not tab2_10min_data.empty else JHONO_SIZE_MIN * 2
+    if not jhono_size_max > JHONO_SIZE_MIN:
+        jhono_size_max = JHONO_SIZE_MIN * 2
+
+    def jhono_point_sizes(j_hono):
+        # larger j_HONO -> larger marker; one scale for both figures so sizes compare across them.
+        # The diameter grows linearly with j_HONO; scatter() takes marker area, so return diameter squared
+        above_min = (np.asarray(j_hono, dtype=float) - JHONO_SIZE_MIN).clip(min=0)
+        diameter = JHONO_DIAMETER_MIN + JHONO_DIAMETER_STEP * above_min / JHONO_VALUE_STEP
+        return diameter ** 2
+
+    def add_jhono_size_legend():
+        # always show the cut-off itself, since every value at or below it gets that smallest marker
+        values = [JHONO_SIZE_MIN] + [v for v in MaxNLocator(nbins=4).tick_values(JHONO_SIZE_MIN, jhono_size_max)
+                                     if JHONO_SIZE_MIN < v <= jhono_size_max and not np.isclose(v, JHONO_SIZE_MIN)]
+        handles = [
+            Line2D([], [], linestyle="", marker="o", markersize=np.sqrt(jhono_point_sizes(v)),
+                   markerfacecolor="lightgray", markeredgecolor="black", markeredgewidth=0.5)
+            for v in values
+        ]
+        labels = [f"≤ {v * 1e4:.3g}e-4" if v == JHONO_SIZE_MIN else f"{v * 1e4:.3g}e-4" for v in values]
+        ax.legend(handles, labels, title="j_HONO (s-1)",
+                  loc="best", fontsize=8, title_fontsize=8, labelspacing=1.0, borderpad=0.8)
+
     # one fixed edge colour per experiment day, so a day keeps its colour in every figure
     day_colors = {
         datetime.fromisoformat(d).date(): DAY_EDGE_COLORS.get(d, DAY_EDGE_CMAP(i % DAY_EDGE_CMAP.N))
@@ -812,12 +854,13 @@ def create_tab2(frame):
         # placed in the strip reserved right of the colour bar, so it never covers data
         days = [d for d in day_colors if d in set(data["date"])]
         handles = [
-            Line2D([], [], linestyle="", marker="o", markersize=8, markerfacecolor="white",
-                   markeredgecolor=day_colors[d], markeredgewidth=2.0)
+            Line2D([], [], linestyle="", marker="o", markersize=DAY_LEGEND_MARKER_SIZE, markerfacecolor="white",
+                   markeredgecolor=day_colors[d], markeredgewidth=2.5)
             for d in days
         ]
         legend = fig.legend(handles, [EXPERIMENT_LABELS.get(d.isoformat(), d.isoformat()) for d in days],
-                            title="Experiment", loc="center right", fontsize=8, title_fontsize=8, frameon=False)
+                            title="Experiment", loc="center right", fontsize=DAY_LEGEND_FONT_SIZE,
+                            title_fontsize=DAY_LEGEND_FONT_SIZE + 1, labelspacing=0.8, frameon=False)
         # fraction of the figure width the legend needs, so the plot can be squeezed to make room for it
         width = legend.get_window_extent(fig.canvas.get_renderer()).width
         return min(width / fig.bbox.width + 0.01, 0.5)
@@ -836,7 +879,9 @@ def create_tab2(frame):
 
         if selected in OPR_10MIN_FIGURES:
             x_col, x_label, c_col, c_label = OPR_10MIN_FIGURES[selected]
-            plot_data = tab2_10min_data.dropna(subset=[x_col, "opr_ppbv_h", c_col]) if not tab2_10min_data.empty else tab2_10min_data
+            sized_by_jhono = selected in JHONO_SIZED_FIGURES
+            required = [x_col, "opr_ppbv_h", c_col] + (["j_hono"] if sized_by_jhono else [])
+            plot_data = tab2_10min_data.dropna(subset=required) if not tab2_10min_data.empty else tab2_10min_data
             if plot_data.empty:
                 message_label.config(text=f"No valid 10-minute OPR data with {c_label} available.")
                 canvas.draw()
@@ -854,7 +899,7 @@ def create_tab2(frame):
                 cmap="YlOrRd",
                 vmin=vmin,
                 vmax=vmax,
-                s=point_sizes(plot_data["elapsed_h"]),
+                s=jhono_point_sizes(plot_data["j_hono"]) if sized_by_jhono else point_sizes(plot_data["elapsed_h"]),
                 edgecolor=day_edge_colors(plot_data),
                 linewidth=DAY_EDGE_WIDTH,
             )
@@ -864,7 +909,10 @@ def create_tab2(frame):
                 (clipped_low, clipped_high), "neither")
             current_cbar = fig.colorbar(scatter, ax=ax, extend=extend)
             current_cbar.set_label(c_label)
-            add_size_legend()
+            if sized_by_jhono:
+                add_jhono_size_legend()
+            else:
+                add_size_legend()
             day_legend_data = plot_data
             hover_scatter, hover_labels = scatter, window_labels(plot_data)
 
